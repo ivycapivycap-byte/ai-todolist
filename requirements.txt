@@ -1,7 +1,7 @@
-fastapi==0.115.0
-uvicorn==0.30.6
-firebase-admin==6.5.0
-google-cloud-firestore==2.19.0
-pydantic==2.9.2
-mcp==1.6.0
-tzdata==2024.2
+fastapi
+uvicorn
+firebase-admin
+google-cloud-firestore
+pydantic
+mcp
+tzdata
