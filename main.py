@@ -9,6 +9,7 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field
 
@@ -20,12 +21,7 @@ COLLECTION_NAME = "tasks"
 
 
 def init_firestore():
-    """
-    初始化 Google Cloud Firestore 数据库连接。
-    支持两种方式（新手最友好）：
-    1. 云端部署：读取环境变量 FIREBASE_CREDENTIALS_JSON（直接粘贴 JSON 内容）
-    2. 本地运行：读取同目录下的 serviceAccountKey.json 文件
-    """
+    """初始化 Google Cloud Firestore 数据库连接"""
     if not firebase_admin._apps:
         cred_json = os.getenv("FIREBASE_CREDENTIALS_JSON")
         if cred_json:
@@ -36,7 +32,6 @@ def init_firestore():
             cred = credentials.Certificate("serviceAccountKey.json")
             firebase_admin.initialize_app(cred)
         else:
-            # 如果在 Google Cloud Run 等环境中，可自动使用默认凭据
             firebase_admin.initialize_app()
     return firestore.client()
 
@@ -45,16 +40,10 @@ def init_firestore():
 # 2. 中文自然语言时间提取器（支持从标题自动提取截止时间）
 # ==========================================
 def extract_time_from_text(text: str, explicit_due_date: Optional[str] = None) -> tuple[str, str]:
-    """
-    从用户输入的文本中提取日期和时间，返回 (清理后的任务标题, 格式化截止时间 YYYY-MM-DD HH:MM)。
-    如果 AI Agent 已经传入了 explicit_due_date，则优先使用。
-    """
     now = datetime.now(TIMEZONE)
 
-    # 如果 AI 已经帮我们提取好了标准格式时间
     if explicit_due_date and explicit_due_date.strip():
         cleaned_due = explicit_due_date.strip()
-        # 如果只传了日期 YYYY-MM-DD，补全默认时间 23:59
         if re.match(r"^\d{4}-\d{2}-\d{2}$", cleaned_due):
             cleaned_due += " 23:59"
         return text.strip(), cleaned_due
@@ -62,7 +51,6 @@ def extract_time_from_text(text: str, explicit_due_date: Optional[str] = None) -
     target_date = now.date()
     clean_title = text.strip()
 
-    # 1) 提取显式日期：如 2026-10-12 或 10月12日
     ymd_match = re.search(r"(\d{4})[-年/](\d{1,2})[-月/](\d{1,2})[日号]?", clean_title)
     md_match = re.search(r"(\d{1,2})[月/](\d{1,2})[日号]?", clean_title)
 
@@ -75,7 +63,6 @@ def extract_time_from_text(text: str, explicit_due_date: Optional[str] = None) -
         target_date = datetime(now.year, month, day).date()
         clean_title = clean_title.replace(md_match.group(0), "", 1)
     else:
-        # 2) 提取相对日期词：今天、明天、后天、大后天
         relative_days = {
             "大后天": 3,
             "后天": 2,
@@ -92,8 +79,7 @@ def extract_time_from_text(text: str, explicit_due_date: Optional[str] = None) -
                     clean_title = clean_title.replace(word, "", 1)
                 break
 
-    # 3) 提取具体时刻：如 "下午3点半"、"晚上8点"、"15:30"
-    hour, minute = 23, 59  # 默认当天 23:59 截止
+    hour, minute = 23, 59
     time_pattern = re.search(
         r"(早上|上午|中午|下午|晚上|今晚|凌晨)?\s*(\d{1,2})(?:[:点时](\d{1,2}|半)?)?\s*分?",
         clean_title,
@@ -124,11 +110,9 @@ def extract_time_from_text(text: str, explicit_due_date: Optional[str] = None) -
             hour, minute = parsed_hour, parsed_min
             clean_title = clean_title.replace(time_pattern.group(0), "", 1)
 
-    # 如果还有残留的“今晚”，清理掉
     if "今晚" in clean_title:
         clean_title = clean_title.replace("今晚", "", 1)
 
-    # 清理多余连接词和空格，如果清理后为空则保留原标题
     clean_title = re.sub(r"^[的去把在，,。\s]+", "", clean_title).strip()
     if not clean_title:
         clean_title = text.strip()
@@ -138,10 +122,9 @@ def extract_time_from_text(text: str, explicit_due_date: Optional[str] = None) -
 
 
 # ==========================================
-# 3. 核心业务逻辑（供 REST API 和 MCP 共同调用）
+# 3. 核心业务逻辑（供 REST API、网页界面和 MCP 共同调用）
 # ==========================================
 def core_add_task(title: str, due_date: Optional[str] = None) -> dict:
-    """添加待办事项（自动提取时间并存入 Firestore）"""
     db = init_firestore()
     final_title, final_due_date = extract_time_from_text(title, due_date)
     now_str = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
@@ -150,7 +133,7 @@ def core_add_task(title: str, due_date: Optional[str] = None) -> dict:
         "title": final_title,
         "raw_input": title,
         "due_date": final_due_date,
-        "due_day": final_due_date[:10],  # YYYY-MM-DD，方便按天查询
+        "due_day": final_due_date[:10],
         "completed": False,
         "created_at": now_str,
     }
@@ -165,7 +148,6 @@ def core_add_task(title: str, due_date: Optional[str] = None) -> dict:
 
 
 def core_get_today_tasks(include_completed: bool = True) -> dict:
-    """获取今天截止的所有待办事项"""
     db = init_firestore()
     today_str = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
 
@@ -183,26 +165,27 @@ def core_get_today_tasks(include_completed: bool = True) -> dict:
             continue
         tasks.append(data)
 
-    # 按截止时间排序
-    tasks.sort(key=lambda x: x.get("due_date", ""))
+    tasks.sort(key=lambda x: (x.get("completed", False), x.get("due_date", "")))
+    return {"success": True, "date": today_str, "count": len(tasks), "tasks": tasks}
 
-    return {
-        "success": True,
-        "date": today_str,
-        "count": len(tasks),
-        "tasks": tasks,
-    }
+
+def core_get_all_tasks() -> dict:
+    db = init_firestore()
+    today_str = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
+    docs = db.collection(COLLECTION_NAME).stream()
+    tasks = []
+    for doc in docs:
+        data = doc.to_dict()
+        data["id"] = doc.id
+        tasks.append(data)
+    tasks.sort(key=lambda x: (x.get("completed", False), x.get("due_date", "")))
+    return {"success": True, "today": today_str, "count": len(tasks), "tasks": tasks}
 
 
 def core_complete_task(task_id: Optional[str] = None, title_keyword: Optional[str] = None) -> dict:
-    """
-    完成待办事项。
-    支持通过 task_id 精确完成，也支持通过 title_keyword（标题关键词）模糊匹配完成！
-    """
     db = init_firestore()
     now_str = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
 
-    # 方式1：如果提供了 task_id
     if task_id:
         doc_ref = db.collection(COLLECTION_NAME).document(task_id)
         doc = doc_ref.get()
@@ -218,7 +201,6 @@ def core_complete_task(task_id: Optional[str] = None, title_keyword: Optional[st
             "task": updated,
         }
 
-    # 方式2：如果 AI Agent 只提供了任务标题关键词
     if title_keyword:
         docs = (
             db.collection(COLLECTION_NAME)
@@ -242,47 +224,36 @@ def core_complete_task(task_id: Optional[str] = None, title_keyword: Optional[st
 
 
 # ==========================================
-# 4. 创建 MCP 服务器（支持 Cursor / Claude / Cherry Studio 等 MCP 客户端）
+# 4. 创建 MCP 服务器
 # ==========================================
 mcp = FastMCP("TodoList-MCP")
 
 
 @mcp.tool()
 def add_task(title: str, due_date: Optional[str] = None) -> dict:
-    """
-    添加一个新的待办任务，支持从文本中自动提取时间。
-    :param title: 任务标题或包含时间的自然语言描述（例如："明天下午3点开周会"）
-    :param due_date: 可选，格式为 YYYY-MM-DD HH:MM 或 YYYY-MM-DD。若不传则自动从 title 提取时间，默认今天 23:59。
-    """
+    """添加一个新的待办任务，支持从文本中自动提取时间。"""
     return core_add_task(title=title, due_date=due_date)
 
 
 @mcp.tool()
 def get_today_tasks(include_completed: bool = True) -> dict:
-    """
-    获取今天截止的所有待办事项列表。
-    :param include_completed: 是否包含已完成的任务，默认 True
-    """
+    """获取今天截止的所有待办事项列表。"""
     return core_get_today_tasks(include_completed=include_completed)
 
 
 @mcp.tool()
 def complete_task(task_id: Optional[str] = None, title_keyword: Optional[str] = None) -> dict:
-    """
-    将某个待办事项标记为已完成。支持传入 task_id 或任务标题关键词 title_keyword。
-    :param task_id: 待办任务的 ID（可选）
-    :param title_keyword: 待办任务的标题关键词，例如 "周会"（可选）
-    """
+    """将某个待办事项标记为已完成（支持传 task_id 或标题关键词 title_keyword）。"""
     return core_complete_task(task_id=task_id, title_keyword=title_keyword)
 
 
 # ==========================================
-# 5. 创建 FastAPI REST API 服务（支持 Coze / Dify / GPTs / 任何 Agent 调用）
+# 5. 创建 FastAPI REST API + 可视化网页界面
 # ==========================================
 app = FastAPI(
     title="AI Agent 专属待办事项系统 (Firestore + MCP/REST)",
-    description="提供 add_task、get_today_tasks、complete_task 三个标准工具接口，支持 REST API 与 MCP 协议。",
-    version="1.0.0",
+    description="提供 add_task、get_today_tasks、complete_task 三个标准工具接口。",
+    version="1.1.0",
 )
 
 app.add_middleware(
@@ -295,25 +266,160 @@ app.add_middleware(
 
 class AddTaskRequest(BaseModel):
     title: str = Field(..., description="任务标题或带时间的句子，如：'今天下午4点买牛奶'")
-    due_date: Optional[str] = Field(
-        None, description="可选，截止时间（YYYY-MM-DD HH:MM）。不填则自动从 title 中提取时间"
-    )
+    due_date: Optional[str] = Field(None, description="可选，截止时间（YYYY-MM-DD HH:MM）")
 
 
 class CompleteTaskRequest(BaseModel):
-    task_id: Optional[str] = Field(None, description="任务 ID（与 title_keyword 二选一即可）")
+    task_id: Optional[str] = Field(None, description="任务 ID（与 title_keyword 二选一）")
     title_keyword: Optional[str] = Field(None, description="任务标题关键词，如：'买牛奶'")
 
 
-@app.get("/", summary="健康检查")
-def root():
-    return {
-        "status": "running",
-        "service": "AI Agent TodoList API & MCP Server",
-        "docs_url": "/docs",
-        "openapi_url": "/openapi.json",
-        "mcp_sse_url": "/sse",
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>我的 AI 专属待办清单</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 min-h-screen text-slate-800">
+  <div class="max-w-xl mx-auto px-4 py-10">
+    <div class="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
+      <div class="flex items-center justify-between mb-6">
+        <div>
+          <h1 class="text-2xl font-bold text-slate-900">📋 我的 AI 待办清单</h1>
+          <p id="date-subtitle" class="text-sm text-slate-500 mt-1">与 Google Cloud Firestore 实时同步</p>
+        </div>
+        <button onclick="loadTasks()" class="text-sm px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 transition">
+          🔄 刷新
+        </button>
+      </div>
+
+      <!-- 智能输入框 -->
+      <form onsubmit="handleAdd(event)" class="flex gap-2 mb-6">
+        <input
+          id="task-input"
+          type="text"
+          placeholder="输入一句话，如：今天下午4点半拿快递..."
+          class="flex-1 px-4 py-3 rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm"
+          required
+        />
+        <button
+          type="submit"
+          id="add-btn"
+          class="px-5 py-3 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white font-medium text-sm transition whitespace-nowrap"
+        >
+          + 添加
+        </button>
+      </form>
+
+      <!-- 视图切换 -->
+      <div class="flex gap-2 mb-4 border-b border-slate-100 pb-3">
+        <button id="tab-today" onclick="switchTab('today')" class="text-sm font-medium px-3 py-1.5 rounded-lg bg-indigo-50 text-indigo-600">
+          📅 今日待办
+        </button>
+        <button id="tab-all" onclick="switchTab('all')" class="text-sm font-medium px-3 py-1.5 rounded-lg text-slate-600 hover:bg-slate-100">
+          🗂️ 全部待办
+        </button>
+      </div>
+
+      <!-- 任务列表 -->
+      <div id="task-list" class="space-y-2.5">
+        <p class="text-center text-slate-400 py-8 text-sm">正在加载待办事项...</p>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let currentTab = 'today';
+
+    function switchTab(tab) {
+      currentTab = tab;
+      document.getElementById('tab-today').className = tab === 'today'
+        ? 'text-sm font-medium px-3 py-1.5 rounded-lg bg-indigo-50 text-indigo-600'
+        : 'text-sm font-medium px-3 py-1.5 rounded-lg text-slate-600 hover:bg-slate-100';
+      document.getElementById('tab-all').className = tab === 'all'
+        ? 'text-sm font-medium px-3 py-1.5 rounded-lg bg-indigo-50 text-indigo-600'
+        : 'text-sm font-medium px-3 py-1.5 rounded-lg text-slate-600 hover:bg-slate-100';
+      loadTasks();
     }
+
+    async function loadTasks() {
+      const listEl = document.getElementById('task-list');
+      const endpoint = currentTab === 'today' ? '/get_today_tasks' : '/all_tasks';
+      try {
+        const res = await fetch(endpoint);
+        const data = await res.json();
+        const tasks = data.tasks || [];
+        if (tasks.length === 0) {
+          listEl.innerHTML = '<p class="text-center text-slate-400 py-8 text-sm">🎉 暂无待办事项，休息一下吧！</p>';
+          return;
+        }
+        listEl.innerHTML = tasks.map(t => `
+          <div class="flex items-center justify-between p-3.5 rounded-xl border ${t.completed ? 'bg-slate-50 border-slate-100 opacity-60' : 'bg-white border-slate-200 hover:border-indigo-200'} transition">
+            <div class="flex items-center gap-3">
+              <input
+                type="checkbox"
+                ${t.completed ? 'checked disabled' : ''}
+                onchange="completeTask('${t.id}')"
+                class="w-5 h-5 rounded text-indigo-600 focus:ring-indigo-500 cursor-pointer"
+              />
+              <div>
+                <div class="text-sm font-medium ${t.completed ? 'line-through text-slate-400' : 'text-slate-800'}">${t.title}</div>
+                <div class="text-xs text-slate-400 mt-0.5">⏰ 截止：${t.due_date || '未设置'}</div>
+              </div>
+            </div>
+            <span class="text-xs px-2.5 py-1 rounded-full ${t.completed ? 'bg-emerald-50 text-emerald-600' : 'bg-amber-50 text-amber-600'}">
+              ${t.completed ? '已完成' : '待办'}
+            </span>
+          </div>
+        `).join('');
+      } catch (e) {
+        listEl.innerHTML = '<p class="text-center text-red-500 py-8 text-sm">加载失败，请稍后刷新重试</p>';
+      }
+    }
+
+    async function handleAdd(e) {
+      e.preventDefault();
+      const input = document.getElementById('task-input');
+      const btn = document.getElementById('add-btn');
+      const title = input.value.trim();
+      if (!title) return;
+      btn.disabled = true;
+      btn.innerText = '添加中...';
+      try {
+        await fetch('/add_task', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ title })
+        });
+        input.value = '';
+        await loadTasks();
+      } finally {
+        btn.disabled = false;
+        btn.innerText = '+ 添加';
+      }
+    }
+
+    async function completeTask(id) {
+      await fetch('/complete_task', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ task_id: id })
+      });
+      await loadTasks();
+    }
+
+    loadTasks();
+  </script>
+</body>
+</html>
+"""
+
+
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+def root():
+    return DASHBOARD_HTML
 
 
 @app.post("/add_task", operation_id="add_task", summary="添加待办（支持自动提取时间）")
@@ -334,6 +440,14 @@ def api_get_today_tasks(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/all_tasks", include_in_schema=False)
+def api_get_all_tasks():
+    try:
+        return core_get_all_tasks()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/complete_task", operation_id="complete_task", summary="完成待办")
 def api_complete_task(req: CompleteTaskRequest):
     try:
@@ -344,7 +458,6 @@ def api_complete_task(req: CompleteTaskRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# 将 MCP SSE 服务挂载到同一个 FastAPI 应用下，路径为 /sse
 app.mount("/", mcp.sse_app())
 
 
