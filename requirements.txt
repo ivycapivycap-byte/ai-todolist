@@ -3,5 +3,5 @@ uvicorn
 firebase-admin
 google-cloud-firestore
 pydantic
-mcp
+mcp<2
 tzdata
