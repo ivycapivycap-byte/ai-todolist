@@ -5,3 +5,4 @@ google-cloud-firestore
 pydantic
 mcp<2
 tzdata
+google-genai>=2.25.0
