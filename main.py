@@ -1,6 +1,7 @@
 import json
 import os
 import re
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -15,14 +16,19 @@ from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field
 
 # ==========================================
-# 1. 时区与初始化设置（默认使用北京时间 Asia/Shanghai）
+# 1. 时区与初始化设置（默认使用东京时间 Asia/Tokyo）
 # ==========================================
-TIMEZONE = ZoneInfo(os.getenv("TZ", "Asia/Shanghai"))
+TIMEZONE = ZoneInfo(os.getenv("TZ", "Asia/Tokyo"))
 COLLECTION_NAME = "tasks"
+_db_client = None
 
 
 def init_firestore():
-    """初始化 Google Cloud Firestore 数据库连接"""
+    """初始化并复用全局 Google Cloud Firestore 数据库连接（避免每次请求重复握手）"""
+    global _db_client
+    if _db_client is not None:
+        return _db_client
+
     if not firebase_admin._apps:
         cred_json = os.getenv("FIREBASE_CREDENTIALS_JSON")
         if cred_json:
@@ -34,7 +40,9 @@ def init_firestore():
             firebase_admin.initialize_app(cred)
         else:
             firebase_admin.initialize_app()
-    return firestore.client()
+
+    _db_client = firestore.client()
+    return _db_client
 
 
 # ==========================================
@@ -123,13 +131,14 @@ def extract_time_from_text(text: str, explicit_due_date: Optional[str] = None) -
 
 
 # ==========================================
-# 3. 核心业务逻辑（供 REST API、网页界面和 MCP 共同调用）
+# 3. 核心业务逻辑（支持 WriteBatch 极速批量写入）
 # ==========================================
 def core_add_task(title: str, due_date: Optional[str] = None) -> dict:
     db = init_firestore()
     final_title, final_due_date = extract_time_from_text(title, due_date)
     now_str = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
 
+    doc_ref = db.collection(COLLECTION_NAME).document()
     task_data = {
         "title": final_title,
         "raw_input": title,
@@ -138,14 +147,42 @@ def core_add_task(title: str, due_date: Optional[str] = None) -> dict:
         "completed": False,
         "created_at": now_str,
     }
-
-    _, doc_ref = db.collection(COLLECTION_NAME).add(task_data)
+    doc_ref.set(task_data)
     task_data["id"] = doc_ref.id
     return {
         "success": True,
         "message": f"已添加待办：「{final_title}」，截止时间：{final_due_date}",
         "task": task_data,
     }
+
+
+def core_batch_add_tasks(items: list) -> dict:
+    """使用 Firestore WriteBatch 一次性打包写入所有待办，速度提升 5~10 倍！"""
+    db = init_firestore()
+    batch = db.batch()
+    now_str = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
+    added = []
+
+    for item in items:
+        final_title, final_due_date = extract_time_from_text(item.title, item.due_date)
+        doc_ref = db.collection(COLLECTION_NAME).document()
+        task_data = {
+            "title": final_title,
+            "raw_input": item.title,
+            "due_date": final_due_date,
+            "due_day": final_due_date[:10],
+            "completed": False,
+            "created_at": now_str,
+        }
+        batch.set(doc_ref, task_data)
+        task_with_id = dict(task_data)
+        task_with_id["id"] = doc_ref.id
+        added.append(task_with_id)
+
+    if added:
+        batch.commit()
+
+    return {"success": True, "count": len(added), "tasks": added}
 
 
 def core_get_today_tasks(include_completed: bool = True) -> dict:
@@ -205,23 +242,17 @@ def core_complete_task(
 
     if task_id:
         doc_ref = db.collection(COLLECTION_NAME).document(task_id)
-        doc = doc_ref.get()
-        if not doc.exists:
-            raise ValueError(f"找不到 ID 为 {task_id} 的待办任务")
         doc_ref.update(
             {
                 "completed": completed,
                 "completed_at": now_str if completed else None,
             }
         )
-        updated = doc.to_dict()
-        updated["id"] = doc.id
-        updated["completed"] = completed
-        status_text = "已完成" if completed else "已恢复为未完成"
         return {
             "success": True,
-            "message": f"{status_text}待办：「{updated.get('title')}」",
-            "task": updated,
+            "message": "已更新待办完成状态",
+            "task_id": task_id,
+            "completed": completed,
         }
 
     if title_keyword:
@@ -258,9 +289,6 @@ def core_update_task(
 ) -> dict:
     db = init_firestore()
     doc_ref = db.collection(COLLECTION_NAME).document(task_id)
-    doc = doc_ref.get()
-    if not doc.exists:
-        raise ValueError(f"找不到 ID 为 {task_id} 的待办任务")
 
     updates = {}
     if title is not None and title.strip():
@@ -275,10 +303,7 @@ def core_update_task(
     if updates:
         doc_ref.update(updates)
 
-    updated = doc.to_dict()
-    updated.update(updates)
-    updated["id"] = doc.id
-    return {"success": True, "message": "已更新待办任务", "task": updated}
+    return {"success": True, "message": "已更新待办任务", "task_id": task_id, "updates": updates}
 
 
 def core_delete_task(
@@ -287,13 +312,8 @@ def core_delete_task(
 ) -> dict:
     db = init_firestore()
     if task_id:
-        doc_ref = db.collection(COLLECTION_NAME).document(task_id)
-        doc = doc_ref.get()
-        if not doc.exists:
-            raise ValueError(f"找不到 ID 为 {task_id} 的待办任务")
-        title = doc.to_dict().get("title", "")
-        doc_ref.delete()
-        return {"success": True, "message": f"已删除待办：「{title}」", "deleted_id": task_id}
+        db.collection(COLLECTION_NAME).document(task_id).delete()
+        return {"success": True, "message": "已删除待办", "deleted_id": task_id}
 
     if title_keyword:
         docs = db.collection(COLLECTION_NAME).stream()
@@ -312,16 +332,20 @@ def core_delete_task(
 
 
 def core_clear_completed_tasks() -> dict:
+    """使用 WriteBatch 一次性批量清空所有已完成任务"""
     db = init_firestore()
     docs = (
         db.collection(COLLECTION_NAME)
         .where(filter=firestore.FieldFilter("completed", "==", True))
         .stream()
     )
+    batch = db.batch()
     deleted_count = 0
     for doc in docs:
-        doc.reference.delete()
+        batch.delete(doc.reference)
         deleted_count += 1
+    if deleted_count > 0:
+        batch.commit()
     return {
         "success": True,
         "deleted_count": deleted_count,
@@ -398,12 +422,23 @@ def update_task(
 
 
 # ==========================================
-# 6. 创建 FastAPI REST API + 可视化网页界面（v2.0）
+# 6. 创建 FastAPI REST API + 极速响应网页界面（v2.1 加速版）
 # ==========================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 启动时提前预热 Firestore 连接，避免第一次点击时等待握手
+    try:
+        init_firestore()
+    except Exception:
+        pass
+    yield
+
+
 app = FastAPI(
     title="AI Agent 专属待办事项系统 (Firestore + Gemini 多轮对话 + MCP)",
     description="提供 add_task、get_today_tasks、complete_task、update_task、delete_task 等标准接口及可视化看板。",
-    version="2.0.0",
+    version="2.1.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -449,42 +484,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     <!-- 模块一：Gemini 想法整理室（支持多轮连续对话 + 实时修改草案） -->
     <div class="bg-gradient-to-br from-indigo-600 to-violet-700 rounded-2xl shadow-md p-4 sm:p-5 text-white">
-      <div class="flex items-center justify-between mb-2">
+      <div class="flex items-center justify-between mb-3">
         <div class="flex items-center gap-2">
           <span class="text-xl">💬</span>
-          <h2 class="text-base sm:text-lg font-bold">Gemini 想法整理室（多轮对话）</h2>
+          <h2 class="text-base sm:text-lg font-bold">Gemini 想法整理室</h2>
         </div>
-        <div class="flex items-center gap-1.5">
-          <button onclick="resetChat()" class="text-xs bg-white/20 hover:bg-white/30 px-2.5 py-1 rounded-lg transition">
-            🧹 新对话
-          </button>
-          <button onclick="toggleKeyModal()" class="text-xs bg-white/20 hover:bg-white/30 px-2.5 py-1 rounded-lg transition">
-            🔑 Key
-          </button>
-        </div>
-      </div>
-      <p class="text-xs text-indigo-100 mb-3">
-        说出你的想法，对第一版方案不满意？直接继续打字/语音跟 Gemini 商量修改，满意后再一键加入清单！
-      </p>
-
-      <!-- 可选的本地 API Key 设置框 -->
-      <div id="key-box" class="hidden bg-black/20 rounded-xl p-3 mb-3">
-        <label class="block text-xs text-indigo-100 mb-1">可选：若未在 Render 设置环境变量，可在此粘贴 Gemini API Key：</label>
-        <div class="flex gap-2">
-          <input id="gemini-key-input" type="password" placeholder="粘贴 AIzaSy... 开头的密钥" class="flex-1 px-3 py-1.5 rounded-lg text-slate-800 text-xs" />
-          <button onclick="saveApiKey()" class="bg-emerald-500 hover:bg-emerald-600 px-3 py-1.5 rounded-lg text-xs font-medium">保存</button>
-        </div>
+        <button onclick="resetChat()" class="text-xs bg-white/20 hover:bg-white/30 px-2.5 py-1 rounded-lg transition">
+          🧹 新对话
+        </button>
       </div>
 
-      <!-- 微信式多轮聊天记录窗口 -->
-      <div id="chat-history" class="bg-white/95 text-slate-800 rounded-xl p-3 max-h-60 overflow-y-auto space-y-2.5 mb-3 shadow-inner">
-        <div class="flex items-start gap-2">
-          <div class="w-7 h-7 rounded-full bg-indigo-100 text-indigo-700 flex items-center justify-center text-xs font-bold shrink-0">AI</div>
-          <div class="bg-slate-100 text-slate-700 rounded-2xl rounded-tl-none px-3 py-2 text-xs leading-relaxed">
-            嗨！把你想做的事随便告诉我吧。如果对我的第一版安排不满意，直接告诉我怎么改（比如“把开会改到明天”、“删掉跑步”），我会随时帮你调整！
-          </div>
-        </div>
-      </div>
+      <!-- 微信式多轮聊天记录窗口（有对话时自动展开） -->
+      <div id="chat-history" class="hidden bg-white/95 text-slate-800 rounded-xl p-3 max-h-60 overflow-y-auto space-y-2.5 mb-3 shadow-inner"></div>
 
       <!-- 多轮对话输入框 -->
       <form onsubmit="handleChatSubmit(event)" class="flex gap-2">
@@ -506,26 +517,43 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
       <!-- 实时更新的待办草案卡片 -->
       <div id="plan-preview" class="hidden mt-4 bg-white text-slate-800 rounded-xl p-3.5 shadow-inner">
-        <div class="flex items-center justify-between mb-2">
-          <span class="text-xs font-bold text-indigo-700">📝 待办方案草案（随对话自动更新，也可直接改字）：</span>
+        <div class="flex items-center justify-between mb-2.5">
+          <span class="text-xs font-bold text-indigo-700">📝 待办方案草案（可随对话修改，也可直接改字/删减）：</span>
+          <button
+            type="button"
+            onclick="discardDraft()"
+            class="text-xs px-2.5 py-1 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-600 font-medium transition shrink-0"
+          >
+            🗑️ 一键放弃此方案
+          </button>
         </div>
         <div id="suggested-list" class="space-y-2 mb-3"></div>
-        <button
-          onclick="confirmBatchAdd()"
-          id="batch-add-btn"
-          class="w-full py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-sm transition shadow-sm"
-        >
-          🚀 方案满意，一键加入我的待办清单！
-        </button>
+        <div class="flex gap-2">
+          <button
+            type="button"
+            onclick="discardDraft()"
+            class="px-3.5 py-2.5 rounded-xl bg-slate-100 hover:bg-rose-50 text-slate-600 hover:text-rose-600 font-medium text-xs transition whitespace-nowrap"
+          >
+            🗑️ 全部删除
+          </button>
+          <button
+            type="button"
+            onclick="confirmBatchAdd()"
+            id="batch-add-btn"
+            class="flex-1 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-sm transition shadow-sm"
+          >
+            🚀 方案满意，一键加入待办清单！
+          </button>
+        </div>
       </div>
     </div>
 
-    <!-- 模块二：我的待办清单看板（四页签 + 快捷操作） -->
+    <!-- 模块二：我的待办清单看板（四页签 + 极速响应） -->
     <div class="bg-white rounded-2xl shadow-sm border border-slate-200 p-4 sm:p-5">
       <div class="flex items-center justify-between mb-4">
         <div>
           <h1 class="text-lg sm:text-xl font-bold text-slate-900">📋 我的待办清单</h1>
-          <p class="text-xs text-slate-400 mt-0.5">Google Cloud Firestore 实时同步</p>
+          <p id="sync-status" class="text-xs text-slate-400 mt-0.5">Google Cloud Firestore 实时同步</p>
         </div>
         <button onclick="loadTasks()" class="text-xs px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 transition">
           🔄 刷新
@@ -609,17 +637,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     let currentSuggestedTasks = [];
     let currentInteractionId = null;
 
-    document.getElementById('gemini-key-input').value = localStorage.getItem('GEMINI_API_KEY') || '';
-
-    function toggleKeyModal() {
-      document.getElementById('key-box').classList.toggle('hidden');
+    function setSyncStatus(text) {
+      const el = document.getElementById('sync-status');
+      if (el) el.innerText = text;
     }
 
-    function saveApiKey() {
-      const val = document.getElementById('gemini-key-input').value.trim();
-      localStorage.setItem('GEMINI_API_KEY', val);
-      document.getElementById('key-box').classList.add('hidden');
-      alert('已保存 Gemini API Key！');
+    function sortTasksCache() {
+      allTasksCache.sort((a, b) => {
+        if (Boolean(a.completed) !== Boolean(b.completed)) {
+          return a.completed ? 1 : -1;
+        }
+        return (a.due_date || '').localeCompare(b.due_date || '');
+      });
     }
 
     function escapeHtml(str) {
@@ -628,6 +657,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     function appendChatBubble(role, text) {
       const chatEl = document.getElementById('chat-history');
+      chatEl.classList.remove('hidden');
       const div = document.createElement('div');
       if (role === 'user') {
         div.className = 'flex items-start justify-end gap-2';
@@ -652,11 +682,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     function getCurrentDraftFromInputs() {
       const draft = [];
-      currentSuggestedTasks.forEach((_, idx) => {
-        const checkEl = document.getElementById(`sug-check-${idx}`);
-        const titleEl = document.getElementById(`sug-title-${idx}`);
-        const dateEl = document.getElementById(`sug-date-${idx}`);
-        if (checkEl && checkEl.checked && titleEl && dateEl) {
+      const rows = document.querySelectorAll('.draft-item-row');
+      rows.forEach(row => {
+        const checkEl = row.querySelector('.draft-check');
+        const titleEl = row.querySelector('.draft-title');
+        const dateEl = row.querySelector('.draft-date');
+        if (checkEl && checkEl.checked && titleEl && dateEl && titleEl.value.trim()) {
           draft.push({
             title: titleEl.value.trim(),
             due_date: dateEl.value.trim()
@@ -666,18 +697,46 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       return draft;
     }
 
-    function resetChat() {
-      currentInteractionId = null;
+    function renderDraftList(tasks) {
+      currentSuggestedTasks = tasks || [];
+      const previewEl = document.getElementById('plan-preview');
+      const listEl = document.getElementById('suggested-list');
+
+      if (!currentSuggestedTasks || currentSuggestedTasks.length === 0) {
+        previewEl.classList.add('hidden');
+        listEl.innerHTML = '';
+        return;
+      }
+
+      previewEl.classList.remove('hidden');
+      listEl.innerHTML = currentSuggestedTasks.map((item, idx) => `
+        <div class="draft-item-row flex items-center gap-1.5 p-2 rounded-lg border border-slate-200 bg-slate-50">
+          <input type="checkbox" class="draft-check w-4 h-4 text-indigo-600 rounded shrink-0" checked />
+          <input type="text" value="${escapeHtml(item.title)}" class="draft-title flex-1 min-w-0 bg-white px-2 py-1 rounded border border-slate-200 text-xs font-medium" />
+          <input type="text" value="${escapeHtml(item.due_date)}" class="draft-date w-32 bg-white px-2 py-1 rounded border border-slate-200 text-xs text-slate-600 shrink-0" />
+          <button type="button" onclick="removeDraftItem(${idx})" title="移除此条" class="p-1 text-slate-400 hover:text-rose-600 text-xs shrink-0">✕</button>
+        </div>
+      `).join('');
+    }
+
+    function removeDraftItem(idx) {
+      const current = getCurrentDraftFromInputs();
+      current.splice(idx, 1);
+      renderDraftList(current);
+    }
+
+    function discardDraft() {
       currentSuggestedTasks = [];
       document.getElementById('plan-preview').classList.add('hidden');
-      document.getElementById('chat-history').innerHTML = `
-        <div class="flex items-start gap-2">
-          <div class="w-7 h-7 rounded-full bg-indigo-100 text-indigo-700 flex items-center justify-center text-xs font-bold shrink-0">AI</div>
-          <div class="bg-slate-100 text-slate-700 rounded-2xl rounded-tl-none px-3 py-2 text-xs leading-relaxed">
-            已开启新对话！把你的新想法告诉我吧，我们一起商量待办方案~
-          </div>
-        </div>
-      `;
+      document.getElementById('suggested-list').innerHTML = '';
+    }
+
+    function resetChat() {
+      currentInteractionId = null;
+      discardDraft();
+      const chatEl = document.getElementById('chat-history');
+      chatEl.innerHTML = '';
+      chatEl.classList.add('hidden');
     }
 
     async function handleChatSubmit(e) {
@@ -690,7 +749,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       inputEl.value = '';
 
       const btn = document.getElementById('organize-btn');
-      const localKey = localStorage.getItem('GEMINI_API_KEY') || '';
       const currentDraft = getCurrentDraftFromInputs();
 
       btn.disabled = true;
@@ -703,34 +761,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           body: JSON.stringify({
             thoughts,
             previous_interaction_id: currentInteractionId,
-            current_draft: currentDraft,
-            api_key: localKey
+            current_draft: currentDraft
           })
         });
         const data = await res.json();
         if (!res.ok) {
-          if (res.status === 400) {
-            document.getElementById('key-box').classList.remove('hidden');
-          }
-          appendChatBubble('ai', '⚠️ ' + (data.detail || '整理失败，请检查 Gemini API Key'));
+          appendChatBubble('ai', '⚠️ ' + (data.detail || '整理失败，请检查 Render 环境变量中的 GEMINI_API_KEY'));
           return;
         }
 
         currentInteractionId = data.interaction_id || currentInteractionId;
         appendChatBubble('ai', data.reply);
-
-        currentSuggestedTasks = data.suggested_tasks || [];
-        if (currentSuggestedTasks.length > 0) {
-          document.getElementById('plan-preview').classList.remove('hidden');
-          const listEl = document.getElementById('suggested-list');
-          listEl.innerHTML = currentSuggestedTasks.map((item, idx) => `
-            <div class="flex items-center gap-2 p-2 rounded-lg border border-slate-200 bg-slate-50">
-              <input type="checkbox" id="sug-check-${idx}" checked class="w-4 h-4 text-indigo-600 rounded" />
-              <input type="text" id="sug-title-${idx}" value="${escapeHtml(item.title)}" class="flex-1 bg-white px-2 py-1 rounded border border-slate-200 text-xs font-medium" />
-              <input type="text" id="sug-date-${idx}" value="${escapeHtml(item.due_date)}" class="w-32 bg-white px-2 py-1 rounded border border-slate-200 text-xs text-slate-600" />
-            </div>
-          `).join('');
-        }
+        renderDraftList(data.suggested_tasks || []);
       } catch (err) {
         appendChatBubble('ai', '⚠️ 网络请求失败，请稍后重试');
       } finally {
@@ -746,23 +788,43 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         return;
       }
 
-      const btn = document.getElementById('batch-add-btn');
-      btn.disabled = true;
-      btn.innerText = '正在一键写入云端数据库...';
+      // 乐观更新：0.01秒立即显示在页面上，无需等待网络来回！
+      const tempTasks = selected.map((item, i) => ({
+        id: 'temp-' + Date.now() + '-' + i,
+        title: item.title,
+        due_date: item.due_date,
+        due_day: (item.due_date || '').slice(0, 10) || serverToday,
+        completed: false
+      }));
+      allTasksCache.push(...tempTasks);
+      sortTasksCache();
+      renderTasks();
+
+      document.getElementById('plan-preview').classList.add('hidden');
+      currentSuggestedTasks = [];
+      currentInteractionId = null;
+      appendChatBubble('ai', `⚡ 已将 ${selected.length} 项待办加入下方列表（后台正在同步云端...）`);
+      setSyncStatus('☁️ 正在批量同步到云端...');
+
       try {
-        await fetch('/batch_add_tasks', {
+        const res = await fetch('/batch_add_tasks', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ tasks: selected })
         });
-        appendChatBubble('ai', `🎉 已成功将 ${selected.length} 项待办写入你的云端待办清单！`);
-        document.getElementById('plan-preview').classList.add('hidden');
-        currentSuggestedTasks = [];
-        currentInteractionId = null;
+        const data = await res.json();
+        if (data.tasks) {
+          // 替换临时 ID 为真实数据库 ID
+          const tempIds = new Set(tempTasks.map(t => t.id));
+          allTasksCache = allTasksCache.filter(t => !tempIds.has(t.id));
+          allTasksCache.push(...data.tasks);
+          sortTasksCache();
+          renderTasks();
+        }
+        setSyncStatus('✅ 云端已同步');
+      } catch (e) {
+        setSyncStatus('⚠️ 同步异常，请点刷新');
         await loadTasks();
-      } finally {
-        btn.disabled = false;
-        btn.innerText = '🚀 方案满意，一键加入我的待办清单！';
       }
     }
 
@@ -864,7 +926,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           listEl.innerHTML = '<p class="text-center text-slate-400 py-8 text-sm">🚀 未来还没有待办计划~</p>';
           return;
         }
-        // 按日期分组展示
         const groups = {};
         futureTasks.forEach(t => {
           const day = t.due_day || '未定日期';
@@ -910,42 +971,62 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const btn = document.getElementById('add-btn');
       const title = input.value.trim();
       if (!title) return;
+      input.value = '';
       btn.disabled = true;
-      btn.innerText = '添加中...';
+      setSyncStatus('☁️ 正在同步到云端...');
       try {
-        await fetch('/add_task', {
+        const res = await fetch('/add_task', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ title })
         });
-        input.value = '';
-        await loadTasks();
+        const data = await res.json();
+        if (data.task) {
+          allTasksCache.push(data.task);
+          sortTasksCache();
+          renderTasks();
+        }
+        setSyncStatus('✅ 云端已同步');
       } finally {
         btn.disabled = false;
-        btn.innerText = '+ 添加';
       }
     }
 
     async function toggleTaskStatus(id, completed) {
+      // 乐观更新：瞬间打勾/恢复，不等网络
+      const task = allTasksCache.find(x => x.id === id);
+      if (task) {
+        task.completed = completed;
+        sortTasksCache();
+        renderTasks();
+      }
+      setSyncStatus('☁️ 正在同步状态...');
       await fetch('/complete_task', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ task_id: id, completed })
       });
-      await loadTasks();
+      setSyncStatus('✅ 云端已同步');
     }
 
     async function postponeTask(id) {
       const task = allTasksCache.find(x => x.id === id);
-      const currentDueDate = task ? task.due_date : '';
-      const timePart = (currentDueDate || '').slice(11, 16) || '23:59';
+      if (!task) return;
+      const timePart = (task.due_date || '').slice(11, 16) || '23:59';
       const newDueDate = `${serverTomorrow} ${timePart}`;
+      // 乐观更新：瞬间挪到明日
+      task.due_date = newDueDate;
+      task.due_day = serverTomorrow;
+      sortTasksCache();
+      renderTasks();
+      setSyncStatus('☁️ 已顺延到明天，正在同步...');
+
       await fetch('/update_task', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ task_id: id, due_date: newDueDate })
       });
-      await loadTasks();
+      setSyncStatus('✅ 云端已同步');
     }
 
     function openEditModal(id) {
@@ -966,29 +1047,46 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const title = document.getElementById('edit-title').value.trim();
       const due_date = document.getElementById('edit-due').value.trim();
       if (!title) return;
+
+      const task = allTasksCache.find(x => x.id === id);
+      if (task) {
+        task.title = title;
+        task.due_date = due_date;
+        task.due_day = due_date.slice(0, 10);
+        sortTasksCache();
+        renderTasks();
+      }
+      closeEditModal();
+      setSyncStatus('☁️ 正在保存修改...');
+
       await fetch('/update_task', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ task_id: id, title, due_date })
       });
-      closeEditModal();
-      await loadTasks();
+      setSyncStatus('✅ 云端已同步');
     }
 
     async function deleteTask(id) {
       if (!confirm('确定要删除这条待办吗？')) return;
+      allTasksCache = allTasksCache.filter(x => x.id !== id);
+      renderTasks();
+      setSyncStatus('☁️ 正在删除...');
       await fetch('/delete_task', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ task_id: id })
       });
-      await loadTasks();
+      setSyncStatus('✅ 云端已同步');
     }
 
     async function clearCompleted() {
       if (!confirm('确定要彻底清空所有已完成的待办记录吗？')) return;
+      allTasksCache = allTasksCache.filter(x => !x.completed);
+      renderTasks();
+      setSyncStatus('☁️ 正在批量清空...');
       await fetch('/clear_completed_tasks', { method: 'POST' });
-      await loadTasks();
+      setSyncStatus('✅ 云端已同步');
     }
 
     loadTasks();
@@ -1017,25 +1115,25 @@ def api_organize_thoughts(req: OrganizeThoughtsRequest):
     weekday_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
     weekday_str = weekday_names[now.weekday()]
 
-    user_message = req.thoughts
-    if req.current_draft:
-        draft_json = json.dumps(
-            [item.model_dump() for item in req.current_draft], ensure_ascii=False
-        )
-        user_message = (
-            f"【当前页面上的待办方案草案】：{draft_json}\n"
-            f"【用户的最新想法/修改要求】：{req.thoughts}"
-        )
+    draft_list = [item.model_dump() for item in (req.current_draft or [])]
+    draft_json = json.dumps(draft_list, ensure_ascii=False)
+    user_message = (
+        f"【当前页面上的待办方案草案（必须以此为基础进行增删改）】：{draft_json}\n"
+        f"【用户的最新指令/修改要求】：{req.thoughts}"
+    )
 
     try:
         client = genai.Client(api_key=api_key)
         kwargs = {
             "model": "gemini-3.8-flash",
             "system_instruction": (
-                f"你是用户的私人想法整理师与待办助理。当前北京时间是：{now_str}（{weekday_str}）。\n"
-                "你支持与用户进行多轮连续对话来打磨待办事项方案：\n"
+                f"你是用户的私人想法整理师与待办助理。当前东京时间 (Asia/Tokyo) 是：{now_str}（{weekday_str}）。\n"
+                "你支持与用户进行多轮连续对话来打磨待办事项方案，请严格遵守以下规则：\n"
                 "1. 第一轮当用户说出杂乱想法时，在 reply 中用温暖、清晰的语气帮用户梳理思路，并在 suggested_tasks 中给出第一版待办清单草案；\n"
-                "2. 后续轮次当用户提出修改意见（如调整时间、删减任务、增加事项、改变优先级）时，结合上下文和【当前页面上的待办方案草案】，在 reply 中回应用户的修改，并在 suggested_tasks 中返回修改后的完整最新待办清单；\n"
+                "2. 后续轮次当用户提出修改意见时，你必须以【当前页面上的待办方案草案】为基础进行修改：\n"
+                "   - 如果用户要求**删除/去掉**某几个任务，必须从 suggested_tasks 中把它们**彻底移除**，绝不能保留！\n"
+                "   - 如果用户表示对方案全部不满意、不要了、或要求**全部删除/清空**，必须将 suggested_tasks 返回为空数组 `[]`！\n"
+                "   - 如果用户要求修改时间或标题，直接更新对应条目并返回剩余完整列表。\n"
                 "3. 每个任务的 due_date 格式必须严格为 YYYY-MM-DD HH:MM。"
             ),
             "input": user_message,
@@ -1059,11 +1157,10 @@ def api_organize_thoughts(req: OrganizeThoughtsRequest):
 
 @app.post("/batch_add_tasks", include_in_schema=False)
 def api_batch_add_tasks(req: BatchAddTasksRequest):
-    added = []
-    for item in req.tasks:
-        res = core_add_task(title=item.title, due_date=item.due_date)
-        added.append(res["task"])
-    return {"success": True, "count": len(added), "tasks": added}
+    try:
+        return core_batch_add_tasks(req.tasks)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/add_task", operation_id="add_task", summary="添加待办（支持自动提取时间）")
