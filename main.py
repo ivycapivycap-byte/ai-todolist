@@ -10,6 +10,7 @@ from firebase_admin import credentials, firestore
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
+from google import genai
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field
 
@@ -224,7 +225,29 @@ def core_complete_task(task_id: Optional[str] = None, title_keyword: Optional[st
 
 
 # ==========================================
-# 4. 创建 MCP 服务器
+# 4. Gemini 想法整理与拆解模型
+# ==========================================
+class SuggestedTask(BaseModel):
+    title: str = Field(description="清晰、简练的具体待办事项标题（不包含日期时间词）")
+    due_date: str = Field(description="建议的截止时间，格式必须为 YYYY-MM-DD HH:MM")
+
+
+class ThoughtPlanResult(BaseModel):
+    reply: str = Field(description="用温暖、有条理的语气帮用户梳理想法、缓解焦虑并说明拆解思路")
+    suggested_tasks: list[SuggestedTask] = Field(description="拆解出的具体待办任务清单")
+
+
+class OrganizeThoughtsRequest(BaseModel):
+    thoughts: str = Field(..., description="用户的凌乱想法或碎碎念")
+    api_key: Optional[str] = Field(None, description="可选，前端传入的 Gemini API Key")
+
+
+class BatchAddTasksRequest(BaseModel):
+    tasks: list[SuggestedTask]
+
+
+# ==========================================
+# 5. 创建 MCP 服务器
 # ==========================================
 mcp = FastMCP("TodoList-MCP")
 
@@ -248,12 +271,12 @@ def complete_task(task_id: Optional[str] = None, title_keyword: Optional[str] = 
 
 
 # ==========================================
-# 5. 创建 FastAPI REST API + 可视化网页界面
+# 6. 创建 FastAPI REST API + 可视化网页界面
 # ==========================================
 app = FastAPI(
-    title="AI Agent 专属待办事项系统 (Firestore + MCP/REST)",
-    description="提供 add_task、get_today_tasks、complete_task 三个标准工具接口。",
-    version="1.1.0",
+    title="AI Agent 专属待办事项系统 (Firestore + Gemini + MCP)",
+    description="提供 add_task、get_today_tasks、complete_task 工具接口及 Gemini 想法整理室。",
+    version="1.2.0",
 )
 
 app.add_middleware(
@@ -283,31 +306,87 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-50 min-h-screen text-slate-800">
-  <div class="max-w-xl mx-auto px-4 py-10">
-    <div class="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
-      <div class="flex items-center justify-between mb-6">
-        <div>
-          <h1 class="text-2xl font-bold text-slate-900">📋 我的 AI 待办清单</h1>
-          <p id="date-subtitle" class="text-sm text-slate-500 mt-1">与 Google Cloud Firestore 实时同步</p>
+  <div class="max-w-xl mx-auto px-4 py-6 space-y-5">
+
+    <!-- 模块一：Gemini 想法整理室（微信语音/打字倾诉 -> 一键生成待办） -->
+    <div class="bg-gradient-to-br from-indigo-600 to-violet-700 rounded-2xl shadow-md p-5 text-white">
+      <div class="flex items-center justify-between mb-3">
+        <div class="flex items-center gap-2">
+          <span class="text-xl">✨</span>
+          <h2 class="text-lg font-bold">Gemini 想法整理室</h2>
         </div>
-        <button onclick="loadTasks()" class="text-sm px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 transition">
+        <button onclick="toggleKeyModal()" class="text-xs bg-white/20 hover:bg-white/30 px-2.5 py-1 rounded-lg transition">
+          🔑 设置 Key
+        </button>
+      </div>
+      <p class="text-xs text-indigo-100 mb-3">
+        脑子很乱？把你想做的事随便说出来（在微信里可直接用语音转文字），Gemini 先帮你理清思路，再一键生成待办！
+      </p>
+
+      <!-- 隐藏的 API Key 设置框（直接存在手机本地，不用去 Render 找环境变量也行！） -->
+      <div id="key-box" class="hidden bg-black/20 rounded-xl p-3 mb-3">
+        <label class="block text-xs text-indigo-100 mb-1">填入你的免费 Gemini API Key（会自动保存在当前手机/浏览器）：</label>
+        <div class="flex gap-2">
+          <input id="gemini-key-input" type="password" placeholder="粘贴 AIzaSy... 开头的密钥" class="flex-1 px-3 py-1.5 rounded-lg text-slate-800 text-xs" />
+          <button onclick="saveApiKey()" class="bg-emerald-500 hover:bg-emerald-600 px-3 py-1.5 rounded-lg text-xs font-medium">保存</button>
+        </div>
+      </div>
+
+      <textarea
+        id="thoughts-input"
+        rows="3"
+        placeholder="例如：今天事情好多，下午3点要跟客户开会，晚上想抽空去跑个步，对了家里洗发水快没了得买，还有周五前要把报销单交了..."
+        class="w-full p-3 rounded-xl text-slate-800 text-sm focus:outline-none focus:ring-2 focus:ring-amber-300 resize-none"
+      ></textarea>
+
+      <button
+        onclick="organizeThoughts()"
+        id="organize-btn"
+        class="w-full mt-2.5 py-2.5 rounded-xl bg-white text-indigo-700 font-semibold text-sm hover:bg-indigo-50 transition shadow-sm"
+      >
+        🧠 让 Gemini 帮我整理并拆解待办
+      </button>
+
+      <!-- Gemini 整理结果预览与一键创建区 -->
+      <div id="plan-preview" class="hidden mt-4 bg-white text-slate-800 rounded-xl p-4 shadow-inner">
+        <div id="gemini-reply" class="text-sm text-slate-700 bg-indigo-50/70 p-3 rounded-lg mb-3 leading-relaxed"></div>
+        <div class="text-xs font-semibold text-slate-500 mb-2">👇 勾选要加入清单的任务（可修改文字或时间）：</div>
+        <div id="suggested-list" class="space-y-2 mb-3"></div>
+        <button
+          onclick="confirmBatchAdd()"
+          id="batch-add-btn"
+          class="w-full py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-sm transition"
+        >
+          🚀 确认无误，一键加入我的待办清单！
+        </button>
+      </div>
+    </div>
+
+    <!-- 模块二：我的待办清单看板 -->
+    <div class="bg-white rounded-2xl shadow-sm border border-slate-200 p-5">
+      <div class="flex items-center justify-between mb-4">
+        <div>
+          <h1 class="text-xl font-bold text-slate-900">📋 我的待办清单</h1>
+          <p class="text-xs text-slate-400 mt-0.5">Google Cloud Firestore 实时同步</p>
+        </div>
+        <button onclick="loadTasks()" class="text-xs px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 transition">
           🔄 刷新
         </button>
       </div>
 
-      <!-- 智能输入框 -->
-      <form onsubmit="handleAdd(event)" class="flex gap-2 mb-6">
+      <!-- 单条快速输入框 -->
+      <form onsubmit="handleAdd(event)" class="flex gap-2 mb-5">
         <input
           id="task-input"
           type="text"
-          placeholder="输入一句话，如：今天下午4点半拿快递..."
-          class="flex-1 px-4 py-3 rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm"
+          placeholder="快速记一条，如：今晚8点看书..."
+          class="flex-1 px-3.5 py-2.5 rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm"
           required
         />
         <button
           type="submit"
           id="add-btn"
-          class="px-5 py-3 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white font-medium text-sm transition whitespace-nowrap"
+          class="px-4 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white font-medium text-sm transition whitespace-nowrap"
         >
           + 添加
         </button>
@@ -332,6 +411,103 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
   <script>
     let currentTab = 'today';
+    let currentSuggestedTasks = [];
+
+    // 初始化读取本地保存的 Gemini Key
+    document.getElementById('gemini-key-input').value = localStorage.getItem('GEMINI_API_KEY') || '';
+
+    function toggleKeyModal() {
+      const box = document.getElementById('key-box');
+      box.classList.toggle('hidden');
+    }
+
+    function saveApiKey() {
+      const val = document.getElementById('gemini-key-input').value.trim();
+      localStorage.setItem('GEMINI_API_KEY', val);
+      document.getElementById('key-box').classList.add('hidden');
+      alert('已保存 Gemini API Key！现在可以直接整理想法啦。');
+    }
+
+    async function organizeThoughts() {
+      const thoughts = document.getElementById('thoughts-input').value.trim();
+      if (!thoughts) {
+        alert('请先输入你的想法或要做的事~');
+        return;
+      }
+      const btn = document.getElementById('organize-btn');
+      const localKey = localStorage.getItem('GEMINI_API_KEY') || '';
+      btn.disabled = true;
+      btn.innerText = '🤔 Gemini 正在帮你梳理思路...';
+
+      try {
+        const res = await fetch('/organize_thoughts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ thoughts, api_key: localKey })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          if (res.status === 400) {
+            document.getElementById('key-box').classList.remove('hidden');
+          }
+          alert(data.detail || '整理失败，请检查 Gemini API Key');
+          return;
+        }
+
+        document.getElementById('plan-preview').classList.remove('hidden');
+        document.getElementById('gemini-reply').innerText = '💡 ' + data.reply;
+        currentSuggestedTasks = data.suggested_tasks || [];
+
+        const listEl = document.getElementById('suggested-list');
+        listEl.innerHTML = currentSuggestedTasks.map((item, idx) => `
+          <div class="flex items-center gap-2 p-2.5 rounded-lg border border-slate-200 bg-slate-50">
+            <input type="checkbox" id="sug-check-${idx}" checked class="w-4 h-4 text-indigo-600 rounded" />
+            <input type="text" id="sug-title-${idx}" value="${item.title}" class="flex-1 bg-white px-2 py-1 rounded border border-slate-200 text-xs font-medium" />
+            <input type="text" id="sug-date-${idx}" value="${item.due_date}" class="w-32 bg-white px-2 py-1 rounded border border-slate-200 text-xs text-slate-600" />
+          </div>
+        `).join('');
+      } catch (e) {
+        alert('网络请求失败，请稍后重试');
+      } finally {
+        btn.disabled = false;
+        btn.innerText = '🧠 让 Gemini 帮我整理并拆解待办';
+      }
+    }
+
+    async function confirmBatchAdd() {
+      const selected = [];
+      currentSuggestedTasks.forEach((_, idx) => {
+        const checked = document.getElementById(`sug-check-${idx}`).checked;
+        if (checked) {
+          selected.push({
+            title: document.getElementById(`sug-title-${idx}`).value.trim(),
+            due_date: document.getElementById(`sug-date-${idx}`).value.trim()
+          });
+        }
+      });
+
+      if (selected.length === 0) {
+        alert('请至少勾选一项待办！');
+        return;
+      }
+
+      const btn = document.getElementById('batch-add-btn');
+      btn.disabled = true;
+      btn.innerText = '正在一键写入云端数据库...';
+      try {
+        await fetch('/batch_add_tasks', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tasks: selected })
+        });
+        document.getElementById('thoughts-input').value = '';
+        document.getElementById('plan-preview').classList.add('hidden');
+        await loadTasks();
+      } finally {
+        btn.disabled = false;
+        btn.innerText = '🚀 确认无误，一键加入我的待办清单！';
+      }
+    }
 
     function switchTab(tab) {
       currentTab = tab;
@@ -420,6 +596,53 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 def root():
     return DASHBOARD_HTML
+
+
+@app.post("/organize_thoughts", include_in_schema=False)
+def api_organize_thoughts(req: OrganizeThoughtsRequest):
+    api_key = (req.api_key or "").strip() or os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(
+            status_code=400,
+            detail="请先点击右上角「🔑 设置 Key」填入你的 Gemini API Key（或在 Render 环境变量中设置 GEMINI_API_KEY）",
+        )
+
+    now = datetime.now(TIMEZONE)
+    now_str = now.strftime("%Y-%m-%d %H:%M")
+    weekday_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+    weekday_str = weekday_names[now.weekday()]
+
+    try:
+        client = genai.Client(api_key=api_key)
+        interaction = client.interactions.create(
+            model="gemini-3.8-flash",
+            system_instruction=(
+                f"你是用户的私人想法整理师与待办助理。当前北京时间是：{now_str}（{weekday_str}）。\n"
+                "当用户倾诉一堆杂乱的想法、计划或待办事项时：\n"
+                "1. 请先在 reply 中用温暖、清晰的语气帮用户梳理思路，给出轻重缓急的建议；\n"
+                "2. 将所有需要做的具体行动拆解到 suggested_tasks 列表中；\n"
+                "3. 为每个任务推断合理的截止时间 due_date（格式必须为 YYYY-MM-DD HH:MM，若用户未提具体时刻，可根据事项性质安排在 10:00、15:00、20:00 或 23:59）。"
+            ),
+            input=req.thoughts,
+            response_format={
+                "type": "text",
+                "mime_type": "application/json",
+                "schema": ThoughtPlanResult.model_json_schema(),
+            },
+        )
+        result = ThoughtPlanResult.model_validate_json(interaction.output_text)
+        return result.model_dump()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Gemini 整理出错：{str(e)}")
+
+
+@app.post("/batch_add_tasks", include_in_schema=False)
+def api_batch_add_tasks(req: BatchAddTasksRequest):
+    added = []
+    for item in req.tasks:
+        res = core_add_task(title=item.title, due_date=item.due_date)
+        added.append(res["task"])
+    return {"success": True, "count": len(added), "tasks": added}
 
 
 @app.post("/add_task", operation_id="add_task", summary="添加待办（支持自动提取时间）")
